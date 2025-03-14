@@ -3,8 +3,14 @@
 import io
 import logging
 import re
-from abc import abstractmethod
-from typing import Any, Dict, Generic, Iterator, List, Mapping, Optional, TypeVar, Union
+from typing import (
+    Any,
+    Dict,
+    Iterator,
+    List,
+    Mapping,
+    Optional,
+)
 
 from langchain_core.callbacks import CallbackManagerForLLMRun
 from langchain_core.language_models.llms import LLM
@@ -12,8 +18,9 @@ from langchain_core.outputs import GenerationChunk
 from pydantic import ConfigDict, model_validator
 from typing_extensions import Self
 
-INPUT_TYPE = TypeVar("INPUT_TYPE", bound=Union[str, List[str]])
-OUTPUT_TYPE = TypeVar("OUTPUT_TYPE", bound=Union[str, List[List[float]], Iterator])
+from langchain_aws.utils import ContentHandlerBase
+
+logger = logging.getLogger(__name__)
 
 
 def enforce_stop_tokens(text: str, stop: List[str]) -> str:
@@ -78,52 +85,6 @@ class LineIterator:
                 continue
             self.buffer.seek(0, io.SEEK_END)
             self.buffer.write(chunk["PayloadPart"]["Bytes"])
-
-
-class ContentHandlerBase(Generic[INPUT_TYPE, OUTPUT_TYPE]):
-    """A handler class to transform input from LLM to a
-    format that SageMaker endpoint expects.
-
-    Similarly, the class handles transforming output from the
-    SageMaker endpoint to a format that LLM class expects.
-    """
-
-    """
-    Example:
-        .. code-block:: python
-
-            class ContentHandler(ContentHandlerBase):
-                content_type = "application/json"
-                accepts = "application/json"
-
-                def transform_input(self, prompt: str, model_kwargs: Dict) -> bytes:
-                    input_str = json.dumps({prompt: prompt, **model_kwargs})
-                    return input_str.encode('utf-8')
-                
-                def transform_output(self, output: bytes) -> str:
-                    response_json = json.loads(output.read().decode("utf-8"))
-                    return response_json[0]["generated_text"]
-    """
-
-    content_type: Optional[str] = "text/plain"
-    """The MIME type of the input data passed to endpoint"""
-
-    accepts: Optional[str] = "text/plain"
-    """The MIME type of the response data returned from endpoint"""
-
-    @abstractmethod
-    def transform_input(self, prompt: INPUT_TYPE, model_kwargs: Dict) -> bytes:
-        """Transforms the input to a format that model can accept
-        as the request Body. Should return bytes or seekable file
-        like object in the format specified in the content_type
-        request header.
-        """
-
-    @abstractmethod
-    def transform_output(self, output: bytes) -> OUTPUT_TYPE:
-        """Transforms the output from the model to string that
-        the LLM class expects.
-        """
 
 
 class LLMContentHandler(ContentHandlerBase[str, str]):
@@ -356,7 +317,7 @@ class SagemakerEndpoint(LLM):
                         run_manager.on_llm_new_token(chunk.text)
 
         except Exception as e:
-            logging.error(f"Error raised by streaming inference endpoint: {e}")
+            logger.exception("Error raised by streaming inference endpoint")
             if run_manager is not None:
                 run_manager.on_llm_error(e)
             raise e
@@ -412,7 +373,7 @@ class SagemakerEndpoint(LLM):
         try:
             response = self.client.invoke_endpoint(**invocation_params)
         except Exception as e:
-            logging.error(f"Error raised by inference endpoint: {e}")
+            logger.exception("Error raised by inference endpoint")
             if run_manager is not None:
                 run_manager.on_llm_error(e)
             raise e

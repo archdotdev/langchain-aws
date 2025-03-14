@@ -33,10 +33,14 @@ from typing_extensions import Self
 
 from langchain_aws.function_calling import _tools_in_params
 from langchain_aws.utils import (
+    anthropic_tokens_supported,
     enforce_stop_tokens,
     get_num_tokens_anthropic,
     get_token_ids_anthropic,
+    thinking_in_params,
 )
+
+logger = logging.getLogger(__name__)
 
 AMAZON_BEDROCK_TRACE_KEY = "amazon-bedrock-trace"
 GUARDRAILS_BODY_KEY = "amazon-bedrock-guardrailAction"
@@ -143,6 +147,16 @@ def _stream_response_to_generation_chunk(
                     content=[content_block],
                     tool_call_chunks=[tc_chunk],  # type: ignore
                 )
+            elif stream_response["delta"]["type"] == "thinking_delta":
+                content_block = stream_response["delta"]
+                content_block["index"] = stream_response["index"]
+                content_block["type"] = "thinking"
+                return AIMessageChunk(content=[content_block])
+            elif stream_response["delta"]["type"] == "signature_delta":
+                content_block = stream_response["delta"]
+                content_block["index"] = stream_response["index"]
+                content_block["type"] = "thinking"
+                return AIMessageChunk(content=[content_block])
         elif msg_type == "message_delta":
             return AIMessageChunk(
                 content="",
@@ -163,7 +177,7 @@ def _stream_response_to_generation_chunk(
     return GenerationChunk(
         text=(
             stream_response[output_key]
-            if provider != "mistral"
+            if provider not in ["mistral", "deepseek"]
             else stream_response[output_key][0]["text"]
         ),
         generation_info=generation_info,
@@ -250,6 +264,7 @@ class LLMInputOutputAdapter:
         "anthropic": "completion",
         "amazon": "outputText",
         "cohere": "text",
+        "deepseek": "choices",
         "meta": "generation",
         "mistral": "outputs",
     }
@@ -270,9 +285,60 @@ class LLMInputOutputAdapter:
         input_body = {**model_kwargs}
         if provider == "anthropic":
             if messages:
+                # Check if we're using extended thinking
+                thinking_enabled = thinking_in_params(model_kwargs)
+
                 if tools:
                     input_body["tools"] = tools
                 input_body["anthropic_version"] = "bedrock-2023-05-31"
+
+                # Special handling for tool results with thinking
+                if thinking_enabled:
+                    # Check if we have a tool_result in the last user message
+                    # and need to ensure the previous assistant message starts with thinking
+                    if (
+                        len(messages) >= 2
+                        and messages[-1]["role"] == "user"
+                        and messages[-2]["role"] == "assistant"
+                    ):
+                        # Check if the last user message contains tool_result
+                        last_user_msg = messages[-1].get("content", [])
+                        tool_result = False
+                        if isinstance(last_user_msg, list):
+                            tool_result = any(
+                                item.get("type") == "tool_result"
+                                for item in last_user_msg
+                                if isinstance(item, dict)
+                            )
+
+                        if tool_result:
+                            # Make sure the assistant message has thinking first
+                            asst_content = messages[-2].get("content", [])
+                            if isinstance(asst_content, list) and asst_content:
+                                # Find thinking blocks and move them to the front if needed
+                                thinking_blocks = [
+                                    block
+                                    for block in asst_content
+                                    if isinstance(block, dict)
+                                    and block.get("type")
+                                    in ["thinking", "redacted_thinking"]
+                                ]
+                                if thinking_blocks and asst_content[0].get(
+                                    "type"
+                                ) not in ["thinking", "redacted_thinking"]:
+                                    # Reorder to put thinking blocks first
+                                    new_content = thinking_blocks.copy()
+                                    new_content.extend(
+                                        [
+                                            block
+                                            for block in asst_content
+                                            if isinstance(block, dict)
+                                            and block.get("type")
+                                            not in ["thinking", "redacted_thinking"]
+                                        ]
+                                    )
+                                    messages[-2]["content"] = new_content
+
                 input_body["messages"] = messages
                 if system:
                     input_body["system"] = system
@@ -291,7 +357,7 @@ class LLMInputOutputAdapter:
             if temperature is not None:
                 input_body["temperature"] = temperature
 
-        elif provider in ("ai21", "cohere", "meta", "mistral"):
+        elif provider in ("ai21", "cohere", "meta", "mistral", "deepseek"):
             input_body["prompt"] = prompt
             if max_tokens:
                 if provider == "cohere":
@@ -300,6 +366,8 @@ class LLMInputOutputAdapter:
                     input_body["max_gen_len"] = max_tokens
                 elif provider == "mistral":
                     input_body["max_tokens"] = max_tokens
+                elif provider == "deepseek":
+                    input_body["max_new_tokens"] = max_tokens
                 else:
                     # TODO: Add AI21 support, param depends on specific model.
                     pass
@@ -323,16 +391,35 @@ class LLMInputOutputAdapter:
     def prepare_output(cls, provider: str, response: Any) -> dict:
         text = ""
         tool_calls = []
+        thinking = {}
         response_body = json.loads(response.get("body").read().decode())
 
         if provider == "anthropic":
             if "completion" in response_body:
                 text = response_body.get("completion")
             elif "content" in response_body:
-                content = response_body.get("content")
-                if len(content) == 1 and content[0]["type"] == "text":
-                    text = content[0]["text"]
-                elif any(block["type"] == "tool_use" for block in content):
+                content = response_body.get("content", [])
+                # Extract text content
+                text_blocks = [
+                    block["text"] for block in content if block.get("type") == "text"
+                ]
+                if text_blocks:
+                    text = "".join(text_blocks)
+
+                # Extract thinking content
+                thinking_blocks = [
+                    block for block in content if block.get("type") == "thinking"
+                ]
+                if thinking_blocks:
+                    # Get the first thinking block (there's typically just one)
+                    thinking_block = thinking_blocks[0]
+                    thinking = {
+                        "text": thinking_block.get("thinking", ""),
+                        "signature": thinking_block.get("signature", ""),
+                    }
+
+                # Extract tool calls if present
+                if any(block.get("type") == "tool_use" for block in content):
                     tool_calls = extract_tool_calls(content)
 
         else:
@@ -344,6 +431,8 @@ class LLMInputOutputAdapter:
                 text = response_body.get("generation")
             elif provider == "mistral":
                 text = response_body.get("outputs")[0].get("text")
+            elif provider == "deepseek":
+                text = response_body.get("choices")[0].get("text")
             else:
                 text = response_body.get("results")[0].get("outputText")
 
@@ -352,6 +441,7 @@ class LLMInputOutputAdapter:
         completion_tokens = int(headers.get("x-amzn-bedrock-output-token-count", 0))
         return {
             "text": text,
+            "thinking": thinking,
             "tool_calls": tool_calls,
             "body": response_body,
             "usage": {
@@ -409,6 +499,13 @@ class LLMInputOutputAdapter:
                 yield generation_chunk
 
             if (
+                provider == "deepseek"
+                and chunk_obj.get(output_key)[0].get("stop_reason", "") == "stop"
+            ):
+                yield _get_invocation_metrics_chunk(chunk_obj)
+                return
+
+            elif (
                 provider == "mistral"
                 and chunk_obj.get(output_key, [{}])[0].get("stop_reason", "") == "stop"
             ):
@@ -481,8 +578,8 @@ class BedrockBase(BaseLanguageModel, ABC):
     client: Any = Field(default=None, exclude=True)  #: :meta private:
 
     region_name: Optional[str] = Field(default=None, alias="region")
-    """The aws region e.g., `us-west-2`. Fallsback to AWS_DEFAULT_REGION env variable
-    or region specified in ~/.aws/config in case it is not provided here.
+    """The aws region e.g., `us-west-2`. Fallsback to AWS_REGION or AWS_DEFAULT_REGION
+    env variable or region specified in ~/.aws/config in case it is not provided here.
     """
 
     credentials_profile_name: Optional[str] = Field(default=None, exclude=True)
@@ -496,38 +593,38 @@ class BedrockBase(BaseLanguageModel, ABC):
     aws_access_key_id: Optional[SecretStr] = Field(
         default_factory=secret_from_env("AWS_ACCESS_KEY_ID", default=None)
     )
-    """AWS access key id. 
-    
+    """AWS access key id.
+
     If provided, aws_secret_access_key must also be provided.
     If not specified, the default credential profile or, if on an EC2 instance,
     credentials from IMDS will be used.
     See: https://boto3.amazonaws.com/v1/documentation/api/latest/guide/credentials.html
-    
+
     If not provided, will be read from 'AWS_ACCESS_KEY_ID' environment variable.
     """
 
     aws_secret_access_key: Optional[SecretStr] = Field(
         default_factory=secret_from_env("AWS_SECRET_ACCESS_KEY", default=None)
     )
-    """AWS secret_access_key. 
-    
+    """AWS secret_access_key.
+
     If provided, aws_access_key_id must also be provided.
     If not specified, the default credential profile or, if on an EC2 instance,
     credentials from IMDS will be used.
     See: https://boto3.amazonaws.com/v1/documentation/api/latest/guide/credentials.html
-    
+
     If not provided, will be read from 'AWS_SECRET_ACCESS_KEY' environment variable.
     """
 
     aws_session_token: Optional[SecretStr] = Field(
         default_factory=secret_from_env("AWS_SESSION_TOKEN", default=None)
     )
-    """AWS session token. 
-    
+    """AWS session token.
+
     If provided, aws_access_key_id and aws_secret_access_key must also be provided.
     Not required unless using temporary credentials.
     See: https://boto3.amazonaws.com/v1/documentation/api/latest/guide/credentials.html
-    
+
     If not provided, will be read from 'AWS_SESSION_TOKEN' environment variable.
     """
 
@@ -536,7 +633,7 @@ class BedrockBase(BaseLanguageModel, ABC):
 
     provider: Optional[str] = None
     """The model provider, e.g., amazon, cohere, ai21, etc. When not supplied, provider
-    is extracted from the first part of the model_id e.g. 'amazon' in 
+    is extracted from the first part of the model_id e.g. 'amazon' in
     'amazon.titan-text-express-v1'. This value should be provided for model ids that do
     not have the provider in them, e.g., custom and provisioned models that have an ARN
     associated with them."""
@@ -674,6 +771,7 @@ class BedrockBase(BaseLanguageModel, ABC):
 
             self.region_name = (
                 self.region_name
+                or os.getenv("AWS_REGION")
                 or os.getenv("AWS_DEFAULT_REGION")
                 or session.region_name
             )
@@ -781,6 +879,36 @@ class BedrockBase(BaseLanguageModel, ABC):
 
         provider = self._get_provider()
         params = {**_model_kwargs, **kwargs}
+
+        # Pre-process for thinking with tool use
+        if messages and "claude-3" in self._get_model() and thinking_in_params(params):
+            # We need to ensure thinking blocks are first in assistant messages
+            # Process each message in the sequence
+            for i, message in enumerate(messages):
+                if message.get("role") == "assistant" and i > 0:
+                    content = message.get("content", [])
+                    if isinstance(content, list) and content:
+                        # Find any thinking blocks
+                        thinking_blocks = [
+                            j
+                            for j, item in enumerate(content)
+                            if isinstance(item, dict)
+                            and item.get("type") in ["thinking", "redacted_thinking"]
+                        ]
+
+                        # If thinking blocks exist but aren't first, reorder
+                        if thinking_blocks and thinking_blocks[0] > 0:
+                            # Extract thinking blocks
+                            thinking_content = [content[j] for j in thinking_blocks]
+                            # Extract non-thinking blocks
+                            other_content = [
+                                item
+                                for j, item in enumerate(content)
+                                if j not in thinking_blocks
+                            ]
+                            # Reorder with thinking first
+                            message["content"] = thinking_content + other_content
+
         if "claude-3" in self._get_model() and _tools_in_params(params):
             input_body = LLMInputOutputAdapter.prepare_input(
                 provider=provider,
@@ -824,26 +952,32 @@ class BedrockBase(BaseLanguageModel, ABC):
                 request_options["trace"] = "ENABLED"
 
         try:
+            logger.debug(f"Request body sent to bedrock: {request_options}")
+            logger.info("Using Bedrock Invoke API to generate response")
             response = self.client.invoke_model(**request_options)
 
             (
                 text,
+                thinking,
                 tool_calls,
                 body,
                 usage_info,
                 stop_reason,
             ) = LLMInputOutputAdapter.prepare_output(provider, response).values()
-
+            logger.debug(f"Response received from Bedrock: {response}")
         except Exception as e:
-            logging.error(f"Error raised by bedrock service: {e}")
+            logger.exception("Error raised by bedrock service")
             if run_manager is not None:
                 run_manager.on_llm_error(e)
             raise e
 
         if stop is not None:
             text = enforce_stop_tokens(text, stop)
-
-        llm_output = {"usage": usage_info, "stop_reason": stop_reason}
+        llm_output = {
+            "usage": usage_info,
+            "stop_reason": stop_reason,
+            "thinking": thinking,
+        }
 
         # Verify and raise a callback error if any intervention occurs or a signal is
         # sent from a Bedrock service,
@@ -939,6 +1073,8 @@ class BedrockBase(BaseLanguageModel, ABC):
                     max_tokens=self.max_tokens,
                     temperature=self.temperature,
                 )
+            elif thinking_in_params(params):
+                coerce_content_to_string = False
         body = json.dumps(input_body, default=str)
 
         request_options = {
@@ -962,7 +1098,7 @@ class BedrockBase(BaseLanguageModel, ABC):
             response = self.client.invoke_model_with_response_stream(**request_options)
 
         except Exception as e:
-            logging.error(f"Error raised by bedrock service: {e}")
+            logger.exception("Error raised by bedrock service")
             if run_manager is not None:
                 run_manager.on_llm_error(e)
             raise e
@@ -1297,13 +1433,24 @@ class BedrockLLM(LLM, BedrockBase):
         return "".join([chunk.text for chunk in chunks])
 
     def get_num_tokens(self, text: str) -> int:
-        if self._model_is_anthropic:
-            return get_num_tokens_anthropic(text)
-        else:
-            return super().get_num_tokens(text)
+        if self._model_is_anthropic and not self.custom_get_token_ids:
+            if anthropic_tokens_supported():
+                return get_num_tokens_anthropic(text)
+        return super().get_num_tokens(text)
 
     def get_token_ids(self, text: str) -> List[int]:
-        if self._model_is_anthropic:
-            return get_token_ids_anthropic(text)
-        else:
-            return super().get_token_ids(text)
+        if self._model_is_anthropic and not self.custom_get_token_ids:
+            if anthropic_tokens_supported():
+                return get_token_ids_anthropic(text)
+            else:
+                warnings.warn(
+                    "Falling back to default token method due to missing or "
+                    "incompatible `anthropic` installation "
+                    "(needs <=0.38.0).\n\nIf using `anthropic>0.38.0`, "
+                    "it is recommended to provide the model class with a "
+                    "custom_get_token_ids method implementing a more accurate "
+                    "tokenizer for Anthropic. For get_num_tokens, as another "
+                    "alternative, you can implement your own token counter method "
+                    "using the ChatAnthropic or AnthropicLLM classes."
+                )
+        return super().get_token_ids(text)

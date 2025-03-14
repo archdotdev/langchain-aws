@@ -3,9 +3,11 @@
 from typing import Literal, Type
 
 import pytest
+from langchain_core.exceptions import OutputParserException
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import HumanMessage
-from langchain_standard_tests.integration_tests import ChatModelIntegrationTests
+from langchain_core.tools import BaseTool
+from langchain_tests.integration_tests import ChatModelIntegrationTests
 from pydantic import BaseModel, Field
 from typing_extensions import Annotated, TypedDict
 
@@ -44,8 +46,10 @@ class TestBedrockMistralStandard(ChatModelIntegrationTests):
         return {"temperature": 0, "max_tokens": 100, "stop": []}
 
     @pytest.mark.xfail(reason="Human messages following AI messages not supported.")
-    def test_tool_message_histories_list_content(self, model: BaseChatModel) -> None:
-        super().test_tool_message_histories_list_content(model)
+    def test_tool_message_histories_list_content(
+        self, model: BaseChatModel, my_adder_tool: BaseTool
+    ) -> None:
+        super().test_tool_message_histories_list_content(model, my_adder_tool)
 
 
 class TestBedrockNovaStandard(ChatModelIntegrationTests):
@@ -66,12 +70,16 @@ class TestBedrockNovaStandard(ChatModelIntegrationTests):
         return "auto"
 
     @pytest.mark.xfail(reason="Tool choice 'Any' not supported.")
-    def test_structured_few_shot_examples(self, model: BaseChatModel) -> None:
-        super().test_structured_few_shot_examples(model)
+    def test_structured_few_shot_examples(
+        self, model: BaseChatModel, my_adder_tool: BaseTool
+    ) -> None:
+        super().test_structured_few_shot_examples(model, my_adder_tool)
 
     @pytest.mark.xfail(reason="Human messages following AI messages not supported.")
-    def test_tool_message_histories_list_content(self, model: BaseChatModel) -> None:
-        super().test_tool_message_histories_list_content(model)
+    def test_tool_message_histories_list_content(
+        self, model: BaseChatModel, my_adder_tool: BaseTool
+    ) -> None:
+        super().test_tool_message_histories_list_content(model, my_adder_tool)
 
 
 class TestBedrockCohereStandard(ChatModelIntegrationTests):
@@ -88,7 +96,9 @@ class TestBedrockCohereStandard(ChatModelIntegrationTests):
         return {"temperature": 0, "max_tokens": 100, "stop": []}
 
     @pytest.mark.xfail(reason="Cohere models don't support tool_choice.")
-    def test_structured_few_shot_examples(self, model: BaseChatModel) -> None:
+    def test_structured_few_shot_examples(
+        self, model: BaseChatModel, my_adder_tool: BaseTool
+    ) -> None:
         pass
 
     @pytest.mark.xfail(reason="Cohere models don't support tool_choice.")
@@ -110,7 +120,9 @@ class TestBedrockMetaStandard(ChatModelIntegrationTests):
         return {"temperature": 0.1, "max_tokens": 100, "stop": []}
 
     @pytest.mark.xfail(reason="Meta models don't support tool_choice.")
-    def test_structured_few_shot_examples(self, model: BaseChatModel) -> None:
+    def test_structured_few_shot_examples(
+        self, model: BaseChatModel, my_adder_tool: BaseTool
+    ) -> None:
         pass
 
     # TODO: This needs investigation, if this is a bug with Bedrock or Llama models,
@@ -137,21 +149,24 @@ class TestBedrockMetaStandard(ChatModelIntegrationTests):
     @pytest.mark.xfail(
         reason="Human messages following AI messages not supported by Bedrock."
     )
-    def test_tool_message_histories_list_content(self, model: BaseChatModel) -> None:
-        super().test_tool_message_histories_list_content(model)
+    def test_tool_message_histories_list_content(
+        self, model: BaseChatModel, my_adder_tool: BaseTool
+    ) -> None:
+        super().test_tool_message_histories_list_content(model, my_adder_tool)
+
+
+class ClassifyQuery(BaseModel):
+    """Classify a query."""
+
+    query_type: Literal["cat", "dog"] = Field(
+        description="Classify a query as related to cats or dogs."
+    )
 
 
 def test_structured_output_snake_case() -> None:
     model = ChatBedrockConverse(
         model="anthropic.claude-3-sonnet-20240229-v1:0", temperature=0
     )
-
-    class ClassifyQuery(BaseModel):
-        """Classify a query."""
-
-        query_type: Literal["cat", "dog"] = Field(
-            description="Classify a query as related to cats or dogs."
-        )
 
     chat = model.with_structured_output(ClassifyQuery)
     for chunk in chat.stream("How big are cats?"):
@@ -242,3 +257,80 @@ def test_guardrails() -> None:
     )
     assert response.response_metadata["stopReason"] == "guardrail_intervened"
     assert response.response_metadata["trace"] is not None
+
+
+def test_structured_output_tool_choice_not_supported() -> None:
+    llm = ChatBedrockConverse(model="us.anthropic.claude-3-7-sonnet-20250219-v1:0")
+    with pytest.warns(None) as record:  # type: ignore[call-overload]
+        structured_llm = llm.with_structured_output(ClassifyQuery)
+        response = structured_llm.invoke("How big are cats?")
+    assert len(record) == 0
+    assert isinstance(response, ClassifyQuery)
+
+    # Unsupported params
+    llm = ChatBedrockConverse(
+        model="us.anthropic.claude-3-7-sonnet-20250219-v1:0",
+        max_tokens=5000,
+        additional_model_request_fields={
+            "thinking": {"type": "enabled", "budget_tokens": 2000}
+        },
+    )
+    with pytest.warns(match="structured output"):
+        structured_llm = llm.with_structured_output(ClassifyQuery)
+    response = structured_llm.invoke("How big are cats?")
+    assert isinstance(response, ClassifyQuery)
+
+    with pytest.raises(OutputParserException):
+        structured_llm.invoke("Hello!")
+
+
+def test_structured_output_thinking_force_tool_use() -> None:
+    # Structured output currently relies on forced tool use, which is not supported
+    # when `thinking` is enabled for Claude 3.7. When this test fails, it means that
+    # the feature is supported and the workarounds in `with_structured_output` should
+    # be removed.
+
+    # Instantiate as convenience for getting client
+    llm = ChatBedrockConverse(model="us.anthropic.claude-3-7-sonnet-20250219-v1:0")
+    messages = [
+        {
+            "role": "user",
+            "content": [{"text": "Generate a username for Sally with green hair"}],
+        }
+    ]
+    params = {
+        "modelId": "us.anthropic.claude-3-7-sonnet-20250219-v1:0",
+        "inferenceConfig": {"maxTokens": 5000},
+        "toolConfig": {
+            "tools": [
+                {
+                    "toolSpec": {
+                        "name": "ClassifyQuery",
+                        "description": "Classify a query.",
+                        "inputSchema": {
+                            "json": {
+                                "properties": {
+                                    "queryType": {
+                                        "description": (
+                                            "Classify a query as related to cats or "
+                                            "dogs."
+                                        ),
+                                        "enum": ["cat", "dog"],
+                                        "type": "string",
+                                    }
+                                },
+                                "required": ["query_type"],
+                                "type": "object",
+                            }
+                        },
+                    }
+                }
+            ],
+            "toolChoice": {"tool": {"name": "ClassifyQuery"}},
+        },
+        "additionalModelRequestFields": {
+            "thinking": {"type": "enabled", "budget_tokens": 2000}
+        },
+    }
+    with pytest.raises(llm.client.exceptions.ValidationException):
+        response = llm.client.converse(messages=messages, **params)
